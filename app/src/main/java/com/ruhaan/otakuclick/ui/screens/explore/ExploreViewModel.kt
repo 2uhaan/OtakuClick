@@ -1,19 +1,24 @@
 package com.ruhaan.otakuclick.ui.screens.explore
 
-import androidx.compose.runtime.mutableStateOf
+import android.app.Application
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.launch
 import com.ruhaan.otakuclick.data.api.ApiClient
+import com.ruhaan.otakuclick.data.cache.AppDatabase
+import com.ruhaan.otakuclick.data.cache.CachedAnime
 import com.ruhaan.otakuclick.data.models.TrendingAnimeItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-
 // ViewModel for Explore screen - handles trending anime data
-class ExploreViewModel : ViewModel() {
+class ExploreViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val database = AppDatabase.getDatabase(application)
+    private val animeDao = database.animeDao()
 
 
     // Trending anime list state (unchanged)
@@ -38,6 +43,21 @@ class ExploreViewModel : ViewModel() {
 
         viewModelScope.launch {
             try {
+
+                // 1. Try to load from cache first
+                val cachedData = withContext(Dispatchers.IO) {
+                    animeDao.getCachedAnime("trending")
+                }
+
+                // 2. If cache exists and is recent (less than 10 minutes), use it
+                val tenMinutesAgo = System.currentTimeMillis() - (10 * 60 * 1000)
+                val recentCache = cachedData.filter { it.cachedAt > tenMinutesAgo }
+
+                if (recentCache.isNotEmpty()) {
+                    // Show cached data immediately
+                    trendingAnime = recentCache.map { it.toTrendingAnimeItem() }
+                }
+
                 // Repository call now guaranteed on IO thread
                 val response = withContext(Dispatchers.IO){
                     ApiClient.jikanApi.getCurrentSeasonAnime(limit = 20)
@@ -47,7 +67,7 @@ class ExploreViewModel : ViewModel() {
                     val apiAnime = response.body()?.data ?: emptyList()
 
                     // Transform API data to UI models (this runs on Main thread for UI updates)
-                    trendingAnime = apiAnime.map { anime ->
+                    val newAnimeList = apiAnime.map { anime ->
                         TrendingAnimeItem(
                             id = anime.malId,
                             title = anime.title,
@@ -57,13 +77,29 @@ class ExploreViewModel : ViewModel() {
                             status = anime.status
                         )
                     }
-                } else {
+
+                    // 4. Update UI with fresh data
+                    trendingAnime = newAnimeList
+
+                    // 5. Save to cache for next time
+                    withContext(Dispatchers.IO) {
+                        animeDao.clearCacheType("trending") // Clear old cache
+                        animeDao.insertAnime(
+                            newAnimeList.map { it.toCachedAnime("trending") }
+                        )
+                    }
+
+
+                } else if (recentCache.isEmpty()) {
                     // Fallback to top anime if current season fails
                     loadTopAnime()
                 }
             } catch (_: Exception) {
                 // Network error - try fallback
-                loadTopAnime()
+//                loadTopAnime()
+                if (trendingAnime.isEmpty()) {
+                    loadTopAnime()
+                }
             }
 
             isLoading = false
@@ -109,6 +145,30 @@ class ExploreViewModel : ViewModel() {
 //    fun clearError() {
 //        errorMessage = null
 //    }
+}
+
+// Extension functions for easy conversion
+private fun CachedAnime.toTrendingAnimeItem(): TrendingAnimeItem {
+    return TrendingAnimeItem(
+        id = this.id,
+        title = this.title,
+        imageUrl = this.imageUrl,
+        rating = this.rating,
+        year = this.year,
+        status = this.status
+    )
+}
+
+private fun TrendingAnimeItem.toCachedAnime(type: String): CachedAnime {
+    return CachedAnime(
+        id = this.id,
+        title = this.title,
+        imageUrl = this.imageUrl,
+        rating = this.rating,
+        year = this.year,
+        status = this.status,
+        cacheType = type
+    )
 }
 
 
